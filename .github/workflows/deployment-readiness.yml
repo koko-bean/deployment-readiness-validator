@@ -1,0 +1,43 @@
+name: Deployment readiness
+
+on:
+  workflow_dispatch:
+    inputs:
+      configPath:
+        description: Configuration file to validate
+        required: true
+        default: readiness-config.sample.json
+
+jobs:
+  readiness-check:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Azure login
+        uses: azure/login@v2
+        with:
+          creds: ${{ secrets.AZURE_CREDENTIALS }}
+
+      - name: Install Azure quota extension
+        run: az extension add --name quota --upgrade --yes
+
+      - name: Run deployment readiness checks
+        shell: pwsh
+        run: ./scripts/check-deployment-readiness.ps1 -ConfigPath "${{ inputs.configPath }}" -VerboseOutput
+
+      - name: Upload deployment-readiness artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: deployment-readiness
+          path: artifacts/deployment-readiness/
+          if-no-files-found: ignore
+
+      - name: Report failure
+        if: failure()
+        run: |
+          echo "Deployment readiness validation failed."
+          echo "Check the 'deployment-readiness' artifact for details."
+          exit 1

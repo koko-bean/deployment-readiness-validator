@@ -1,0 +1,67 @@
+{
+  "locations": [
+    "eastus",
+    "westus3"
+  ],
+  "quotas": [
+    {
+      "name": "Standard D-family v5 vCPUs",
+      "providerNamespace": "Microsoft.Compute",
+      "vmSku": "Standard_D4s_v5",
+      "resourceType": "dedicated",
+      "requiredAvailable": 16
+    },
+    {
+      "name": "Total regional vCPUs",
+      "providerNamespace": "Microsoft.Compute",
+      "resourceName": "cores",
+      "resourceType": "dedicated",
+      "requiredAvailable": 10
+    },
+    {
+      "name": "Container Apps managed environments",
+      "providerNamespace": "Microsoft.App",
+      "resourceName": "ManagedEnvironmentCount",
+      "resourceType": "dedicated",
+      "requiredAvailable": 1
+    },
+    {
+      "name": "Standard IPv4 public addresses",
+      "providerNamespace": "Microsoft.Network",
+      "resourceName": "IPv4StandardSkuPublicIpAddresses",
+      "resourceType": "dedicated",
+      "requiredAvailable": 2
+    },
+    {
+      "name": "Premium v3 App Service Plan cores",
+      "providerNamespace": "Microsoft.Web",
+      "resourceName": "standardDADSv5Family",
+      "appServicePlanSku": "P1V3",
+      "appServicePlanTier": "Premium v3",
+      "requiredAvailable": 4
+    },
+    {
+      "name": "PostgreSQL Flexible Server Burstable vCores",
+      "providerNamespace": "Microsoft.DBforPostgreSQL",
+      "resourceName": "standardBSFamily",
+      "postgresFlexibleSku": "Standard_B2ms",
+      "availabilityZone": "auto",
+      "instanceCount": 7,
+      "vCoresPerInstance": 2
+    },
+    {
+      "name": "Azure OpenAI model quota",
+      "providerNamespace": "Microsoft.CognitiveServices",
+      "azureOpenAISku": "S0",
+      "azureOpenAIModel": "gpt-4o",
+      "azureOpenAIDeploymentType": "GlobalStandard",
+      "requiredAvailable": 10
+    },
+    {
+      "name": "Azure AI Search service",
+      "providerNamespace": "Microsoft.Search",
+      "aiSearchSku": "standard",
+      "requiredAvailable": 1
+    }
+  ]
+}
