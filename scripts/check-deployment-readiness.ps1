@@ -28,6 +28,40 @@ function Invoke-AzJson {
   return ($output -join [Environment]::NewLine) | ConvertFrom-Json
 }
 
+function New-ReadinessResult {
+  param(
+    [Parameter(Mandatory)][string]$Location,
+    [Parameter(Mandatory)][string]$Name,
+    [Parameter(Mandatory)][ValidateSet('ready', 'blocked', 'ready-with-risk', 'unknown')][string]$Status,
+    [Parameter(Mandatory)][string]$Category,
+    [Parameter(Mandatory)][string]$Message
+  )
+
+  return [pscustomobject]@{
+    location = $Location
+    name = $Name
+    status = $Status
+    category = $Category
+    message = $Message
+  }
+}
+
+function Test-ArmActionAllowed {
+  param(
+    [Parameter(Mandatory)][object[]]$PermissionBlocks,
+    [Parameter(Mandatory)][string]$Action
+  )
+
+  foreach ($permission in $PermissionBlocks) {
+    $allowed = @($permission.actions | Where-Object { $Action -like [string]$_ }).Count -gt 0
+    $denied = @($permission.notActions | Where-Object { $Action -like [string]$_ }).Count -gt 0
+    if ($allowed -and -not $denied) {
+      return $true
+    }
+  }
+  return $false
+}
+
 Write-Step "Loading configuration"
 if (-not (Test-Path $ConfigPath)) {
   [Console]::Error.WriteLine("Config not found at $ConfigPath. Copy readiness-config.sample.json to readiness-config.json and edit it.")
@@ -60,10 +94,29 @@ if ($locations.Count -eq 0) {
   exit 2
 }
 
+$prerequisiteResults = @()
+
 Write-Step "Validating Azure prerequisites"
 if (-not (Get-Command az -ErrorAction SilentlyContinue)) {
   [Console]::Error.WriteLine("Azure CLI is not installed or is not available on PATH.")
   exit 3
+}
+
+try {
+  $cliVersionResult = Invoke-AzJson -Arguments @('version', '--output', 'json') -Description 'Azure CLI version lookup'
+  $minimumCliVersion = if ($config.prerequisites.minimumAzureCliVersion) {
+    [version][string]$config.prerequisites.minimumAzureCliVersion
+  } else {
+    [version]'2.60.0'
+  }
+  $installedCliVersion = [version][string]$cliVersionResult.'azure-cli'
+  if ($installedCliVersion -lt $minimumCliVersion) {
+    $prerequisiteResults += New-ReadinessResult -Location subscription -Name 'Azure CLI version' -Status unknown -Category 'cli-version-unsupported' -Message "Azure CLI $installedCliVersion is installed; version $minimumCliVersion or later is required."
+  } else {
+    $prerequisiteResults += New-ReadinessResult -Location subscription -Name 'Azure CLI version' -Status ready -Category 'prerequisite' -Message "Azure CLI $installedCliVersion meets the minimum version $minimumCliVersion."
+  }
+} catch {
+  $prerequisiteResults += New-ReadinessResult -Location subscription -Name 'Azure CLI version' -Status unknown -Category 'cli-version-unknown' -Message ([string]$_)
 }
 
 try {
@@ -78,6 +131,11 @@ if ($account.id -ne $subscriptionId) {
   [Console]::Error.WriteLine("Active subscription $($account.id) does not match configured subscription $subscriptionId. Run 'az account set --subscription $subscriptionId'.")
   exit 3
 }
+if ($account.state -and [string]$account.state -ne 'Enabled') {
+  $prerequisiteResults += New-ReadinessResult -Location subscription -Name 'Subscription state' -Status blocked -Category 'subscription-disabled' -Message "Subscription $subscriptionId is $($account.state)."
+} else {
+  $prerequisiteResults += New-ReadinessResult -Location subscription -Name 'Subscription state' -Status ready -Category 'prerequisite' -Message "Subscription $subscriptionId is enabled."
+}
 
 # App Service, Azure OpenAI, and Azure AI Search entries use service-specific
 # APIs. The quota extension/provider registration is only required when at
@@ -89,34 +147,25 @@ $needsQuotaApi = @($config.quotas | Where-Object {
 if ($needsQuotaApi) {
   $quotaExtension = & az extension show --name quota --output none 2>&1
   if ($LASTEXITCODE -ne 0) {
-    [Console]::Error.WriteLine("Azure CLI quota extension is required. Install it with 'az extension add --name quota'.")
-    exit 3
-  }
-
-  $quotaProvider = Invoke-AzJson -Arguments @(
-    'provider', 'show',
-    '--namespace', 'Microsoft.Quota',
-    '--query', '{state:registrationState}',
-    '--output', 'json'
-  ) -Description 'Microsoft.Quota provider lookup'
-
-  if ($quotaProvider.state -ne 'Registered') {
-    [Console]::Error.WriteLine("Microsoft.Quota is $($quotaProvider.state). A subscription owner must run 'az provider register --namespace Microsoft.Quota'.")
-    exit 3
+    $prerequisiteResults += New-ReadinessResult -Location subscription -Name 'Azure CLI quota extension' -Status unknown -Category 'extension-missing' -Message "The Azure CLI quota extension is required. Install it with 'az extension add --name quota'."
+  } else {
+    $prerequisiteResults += New-ReadinessResult -Location subscription -Name 'Azure CLI quota extension' -Status ready -Category 'prerequisite' -Message 'The Azure CLI quota extension is installed.'
   }
 } else {
-  Write-Host "Skipping quota extension/provider registration checks: all configured entries use service-specific readiness APIs." -ForegroundColor DarkGray
+  $prerequisiteResults += New-ReadinessResult -Location subscription -Name 'Azure CLI quota extension' -Status ready -Category 'not-required' -Message 'The configured checks use service-specific APIs and do not require the quota extension.'
 }
 
-$requiredProviders = @(
+$derivedProviders = @(
   $config.quotas | ForEach-Object {
     if ($_.providerNamespace) { [string]$_.providerNamespace }
     elseif ($_.appServicePlanSku) { 'Microsoft.Web' }
     elseif ($_.postgresFlexibleSku) { 'Microsoft.DBforPostgreSQL' }
     elseif ($_.azureOpenAISku) { 'Microsoft.CognitiveServices' }
     elseif ($_.aiSearchSku) { 'Microsoft.Search' }
-  } | Where-Object { $_ } | Select-Object -Unique
+  } | Where-Object { $_ }
 )
+$configuredProviders = @($config.prerequisites.requiredProviders | ForEach-Object { [string]$_ } | Where-Object { $_ })
+$requiredProviders = @($derivedProviders + $configuredProviders + $(if ($needsQuotaApi) { 'Microsoft.Quota' }) | Select-Object -Unique)
 $providerStates = @{}
 foreach ($providerNamespace in $requiredProviders) {
   try {
@@ -127,8 +176,59 @@ foreach ($providerNamespace in $requiredProviders) {
       '--output', 'json'
     ) -Description "$providerNamespace provider registration lookup"
     $providerStates[$providerNamespace] = [string]$provider.state
+    if ($provider.state -eq 'Registered') {
+      $prerequisiteResults += New-ReadinessResult -Location subscription -Name "Provider $providerNamespace" -Status ready -Category 'provider-registered' -Message "$providerNamespace is registered."
+    } else {
+      $prerequisiteResults += New-ReadinessResult -Location subscription -Name "Provider $providerNamespace" -Status blocked -Category 'provider-not-registered' -Message "$providerNamespace is $($provider.state)."
+    }
   } catch {
     $providerStates[$providerNamespace] = 'Unknown'
+    $prerequisiteResults += New-ReadinessResult -Location subscription -Name "Provider $providerNamespace" -Status unknown -Category 'provider-state-unknown' -Message ([string]$_)
+  }
+}
+
+$requiredPermissions = @(
+  'Microsoft.Resources/subscriptions/read'
+  'Microsoft.Resources/subscriptions/providers/read'
+)
+if ($needsQuotaApi) {
+  $requiredPermissions += 'Microsoft.Quota/quotas/read'
+  $requiredPermissions += 'Microsoft.Quota/usages/read'
+}
+$requiredPermissions += @($config.prerequisites.requiredPermissions | ForEach-Object { [string]$_ } | Where-Object { $_ })
+$requiredPermissions = @($requiredPermissions | Select-Object -Unique)
+
+try {
+  $permissionsUri = "https://management.azure.com/subscriptions/$subscriptionId/providers/Microsoft.Authorization/permissions?api-version=2022-04-01"
+  $permissionsResult = Invoke-AzJson -Arguments @('rest', '--method', 'get', '--uri', $permissionsUri, '--output', 'json') -Description 'Effective ARM permissions lookup'
+  $permissionBlocks = @($permissionsResult.value)
+  foreach ($requiredPermission in $requiredPermissions) {
+    if (Test-ArmActionAllowed -PermissionBlocks $permissionBlocks -Action $requiredPermission) {
+      $prerequisiteResults += New-ReadinessResult -Location subscription -Name "Permission $requiredPermission" -Status ready -Category 'permission-granted' -Message "The active principal can perform $requiredPermission."
+    } else {
+      $prerequisiteResults += New-ReadinessResult -Location subscription -Name "Permission $requiredPermission" -Status blocked -Category 'permission-missing' -Message "The active principal does not have $requiredPermission at subscription scope."
+    }
+  }
+} catch {
+  $prerequisiteResults += New-ReadinessResult -Location subscription -Name 'Effective ARM permissions' -Status unknown -Category 'permissions-unknown' -Message ([string]$_)
+}
+
+foreach ($feature in @($config.prerequisites.requiredFeatures)) {
+  $featureNamespace = [string]$feature.namespace
+  $featureName = [string]$feature.name
+  if ([string]::IsNullOrWhiteSpace($featureNamespace) -or [string]::IsNullOrWhiteSpace($featureName)) {
+    $prerequisiteResults += New-ReadinessResult -Location subscription -Name 'Azure feature registration' -Status unknown -Category 'invalid-configuration' -Message 'Each requiredFeatures entry must set namespace and name.'
+    continue
+  }
+
+  $featureOutput = & az feature show --namespace $featureNamespace --name $featureName --query properties.state --output tsv 2>&1
+  if ($LASTEXITCODE -ne 0) {
+    $prerequisiteResults += New-ReadinessResult -Location subscription -Name "Feature $featureNamespace/$featureName" -Status unknown -Category 'feature-state-unknown' -Message ($featureOutput -join [Environment]::NewLine)
+  } elseif (($featureOutput -join '').Trim() -eq 'Registered') {
+    $prerequisiteResults += New-ReadinessResult -Location subscription -Name "Feature $featureNamespace/$featureName" -Status ready -Category 'feature-registered' -Message "$featureNamespace/$featureName is registered."
+  } else {
+    $state = ($featureOutput -join '').Trim()
+    $prerequisiteResults += New-ReadinessResult -Location subscription -Name "Feature $featureNamespace/$featureName" -Status blocked -Category 'feature-not-registered' -Message "$featureNamespace/$featureName is $state."
   }
 }
 
@@ -410,26 +510,8 @@ function Test-AISearchReadiness {
   }
 }
 
-function New-ReadinessResult {
-  param(
-    [Parameter(Mandatory)][string]$Location,
-    [Parameter(Mandatory)][string]$Name,
-    [Parameter(Mandatory)][ValidateSet('ready', 'blocked', 'ready-with-risk', 'unknown')][string]$Status,
-    [Parameter(Mandatory)][string]$Category,
-    [Parameter(Mandatory)][string]$Message
-  )
-
-  return [pscustomobject]@{
-    location = $Location
-    name = $Name
-    status = $Status
-    category = $Category
-    message = $Message
-  }
-}
-
 $checkErrors = @()
-$readinessResults = @()
+$readinessResults = @($prerequisiteResults)
 
 Write-Step "Checking deployment readiness"
 foreach ($location in $locations) {
@@ -468,7 +550,9 @@ foreach ($location in $locations) {
     if ($providerNamespace -and $providerStates[$providerNamespace] -ne 'Registered') {
       $state = if ($providerStates.ContainsKey($providerNamespace)) { $providerStates[$providerNamespace] } else { 'Unknown' }
       $reason = "Resource provider $providerNamespace is $state for this subscription."
-      $readinessResults += New-ReadinessResult -Location $location -Name $displayName -Status blocked -Category 'provider-not-registered' -Message $reason
+      $status = if ($state -eq 'Unknown') { 'unknown' } else { 'blocked' }
+      $category = if ($state -eq 'Unknown') { 'provider-state-unknown' } else { 'provider-not-registered' }
+      $readinessResults += New-ReadinessResult -Location $location -Name $displayName -Status $status -Category $category -Message $reason
       Write-Warning $reason
       continue
     }
@@ -773,7 +857,7 @@ $readinessResults | Format-Table location, name, status, category -AutoSize
 Write-Host "Readiness JSON: $readinessJsonPath"
 Write-Host "Readiness summary: $readinessMarkdownPath"
 
-if ($checkErrors.Count -gt 0) {
+if (@($readinessResults | Where-Object status -eq 'unknown').Count -gt 0) {
   $checkErrors | ForEach-Object { Write-Host "- $_" -ForegroundColor Red }
   [Console]::Error.WriteLine("One or more readiness checks are unknown. No deployment decision should be made from partial results.")
   exit 3

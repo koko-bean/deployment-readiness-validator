@@ -1,4 +1,12 @@
 {
+  "prerequisites": {
+    "minimumAzureCliVersion": "2.60.0",
+    "requiredProviders": [
+      "Microsoft.Authorization"
+    ],
+    "requiredPermissions": [],
+    "requiredFeatures": []
+  },
   "locations": [
     "eastus",
     "westus3"

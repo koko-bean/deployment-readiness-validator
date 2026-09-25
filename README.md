@@ -5,7 +5,10 @@ Validate Azure deployment prerequisites before provisioning resources.
 The validator surfaces issues that Azure exposes programmatically:
 
 - quota deficits;
+- missing effective ARM permissions;
 - unregistered resource providers;
+- unregistered subscription feature flags;
+- unsupported Azure CLI or missing extension prerequisites;
 - subscription and regional SKU restrictions;
 - Azure OpenAI account eligibility and model quota;
 - Azure AI Search SKU and service-count quota;
@@ -45,6 +48,12 @@ single `location` property is also supported.
 ```json
 {
   "subscriptionId": "<subscription-id>",
+  "prerequisites": {
+    "minimumAzureCliVersion": "2.60.0",
+    "requiredProviders": ["Microsoft.Authorization"],
+    "requiredPermissions": [],
+    "requiredFeatures": []
+  },
   "locations": ["centralus", "westus3"],
   "quotas": [
     {
@@ -76,6 +85,48 @@ single `location` property is also supported.
 
 Custom quota scopes can contain `{subscriptionId}` and `{location}`
 placeholders.
+
+## Subscription prerequisites
+
+The validator checks standard prerequisites before evaluating regions:
+
+- minimum Azure CLI version;
+- authenticated and enabled subscription;
+- Azure CLI `quota` extension when Microsoft.Quota checks are configured;
+- registration state for every provider derived from the resource checks;
+- additional providers listed in `prerequisites.requiredProviders`;
+- effective ARM permissions at subscription scope;
+- optional Azure feature registrations.
+
+The baseline permission checks include:
+
+- `Microsoft.Resources/subscriptions/read`
+- `Microsoft.Resources/subscriptions/providers/read`
+- `Microsoft.Quota/quotas/read` when Microsoft.Quota is used
+- `Microsoft.Quota/usages/read` when Microsoft.Quota is used
+
+Add deployment-specific ARM actions to `requiredPermissions` when a custom role
+must be validated:
+
+```json
+"requiredPermissions": [
+  "Microsoft.Network/virtualNetworks/read"
+]
+```
+
+Feature registrations are optional and use namespace/name pairs:
+
+```json
+"requiredFeatures": [
+  {
+    "namespace": "Microsoft.Example",
+    "name": "RequiredPreviewFeature"
+  }
+]
+```
+
+Missing permissions, providers, disabled subscriptions, and unregistered
+features are `blocked`. A prerequisite that cannot be queried is `unknown`.
 
 ## Run
 
