@@ -2,7 +2,12 @@
   "prerequisites": {
     "minimumAzureCliVersion": "2.60.0",
     "requiredProviders": [
-      "Microsoft.Authorization"
+      "Microsoft.Authorization",
+      "Microsoft.Web",
+      "Microsoft.DBforPostgreSQL",
+      "Microsoft.CognitiveServices",
+      "Microsoft.Search",
+      "Microsoft.Cache"
     ],
     "requiredPermissions": [],
     "requiredFeatures": []
@@ -13,62 +18,40 @@
   ],
   "quotas": [
     {
-      "name": "Standard D-family v5 vCPUs",
-      "providerNamespace": "Microsoft.Compute",
-      "vmSku": "Standard_D4s_v5",
-      "resourceType": "dedicated",
-      "requiredAvailable": 16
-    },
-    {
-      "name": "Total regional vCPUs",
-      "providerNamespace": "Microsoft.Compute",
-      "resourceName": "cores",
-      "resourceType": "dedicated",
-      "requiredAvailable": 10
-    },
-    {
-      "name": "Container Apps managed environments",
-      "providerNamespace": "Microsoft.App",
-      "resourceName": "ManagedEnvironmentCount",
-      "resourceType": "dedicated",
-      "requiredAvailable": 1
-    },
-    {
-      "name": "Standard IPv4 public addresses",
-      "providerNamespace": "Microsoft.Network",
-      "resourceName": "IPv4StandardSkuPublicIpAddresses",
-      "resourceType": "dedicated",
-      "requiredAvailable": 2
-    },
-    {
-      "name": "Premium v3 App Service Plan cores",
+      "name": "Basic App Service Plan",
       "providerNamespace": "Microsoft.Web",
       "resourceName": "standardDADSv5Family",
-      "appServicePlanSku": "P1V3",
-      "appServicePlanTier": "Premium v3",
-      "requiredAvailable": 4
+      "appServicePlanSku": "B1",
+      "appServicePlanTier": "Basic",
+      "requiredAvailable": 14
     },
     {
-      "name": "PostgreSQL Flexible Server Burstable vCores",
+      "name": "PostgreSQL Flexible Server General Purpose vCores",
       "providerNamespace": "Microsoft.DBforPostgreSQL",
-      "resourceName": "standardBSFamily",
-      "postgresFlexibleSku": "Standard_B2ms",
+      "resourceName": "standardDDSv5Family",
+      "postgresFlexibleSku": "GP_Standard_D2ds_v5",
       "availabilityZone": "auto",
-      "instanceCount": 7,
+      "instanceCount": 8,
       "vCoresPerInstance": 2
     },
     {
-      "name": "Azure OpenAI model quota",
+      "name": "Azure OpenAI",
       "providerNamespace": "Microsoft.CognitiveServices",
       "azureOpenAISku": "S0",
-      "azureOpenAIModel": "gpt-4o",
-      "azureOpenAIDeploymentType": "GlobalStandard",
+      "azureOpenAIModel": "gpt-5.1",
+      "azureOpenAIDeploymentType": "DataZoneStandard",
       "requiredAvailable": 10
     },
     {
-      "name": "Azure AI Search service",
+      "name": "Azure AI Search",
       "providerNamespace": "Microsoft.Search",
       "aiSearchSku": "standard",
+      "requiredAvailable": 1
+    },
+    {
+      "name": "Azure Managed Redis",
+      "providerNamespace": "Microsoft.Cache",
+      "redisEnterpriseSku": "Balanced_B1",
       "requiredAvailable": 1
     }
   ]

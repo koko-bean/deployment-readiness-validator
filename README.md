@@ -12,26 +12,33 @@ The validator surfaces issues that Azure exposes programmatically:
 - subscription and regional SKU restrictions;
 - Azure OpenAI account eligibility and model quota;
 - Azure AI Search SKU and service-count quota;
+- Azure Managed Redis SKU eligibility;
 - PostgreSQL Flexible Server SKU and availability-zone compatibility;
 - App Service regional SKU and quota headroom;
 - exact VM SKU restrictions.
 
-It does not claim to predict physical PaaS capacity. App Service and Azure AI
-Search are returned as `ready-with-risk` when every verifiable check passes but
-Azure does not expose a reliable allocation signal.
+It does not claim to predict physical PaaS capacity. App Service, Azure AI
+Search, and Azure Managed Redis are returned as `ready-with-risk` when every
+verifiable check passes but Azure does not expose a reliable allocation signal.
 
 ## Requirements
 
 - PowerShell 7
 - Azure CLI
-- Azure CLI `quota` extension when the configuration contains providers checked
-  through Microsoft.Quota
+- Azure CLI `quota` extension only when the configuration contains generic
+  providers checked through Microsoft.Quota
 - Reader access to the target subscription and quota APIs
 
 ```powershell
-az extension add --name quota --upgrade --yes
 az login
 az account set --subscription <subscription-id>
+```
+
+Install the quota extension only for configurations that include generic
+Microsoft.Quota checks:
+
+```powershell
+az extension add --name quota --upgrade --yes
 ```
 
 ## Configure
@@ -47,30 +54,44 @@ single `location` property is also supported.
 
 ```json
 {
-  "subscriptionId": "<subscription-id>",
   "prerequisites": {
     "minimumAzureCliVersion": "2.60.0",
-    "requiredProviders": ["Microsoft.Authorization"],
+    "requiredProviders": [
+      "Microsoft.Authorization",
+      "Microsoft.Web",
+      "Microsoft.DBforPostgreSQL",
+      "Microsoft.CognitiveServices",
+      "Microsoft.Search",
+      "Microsoft.Cache"
+    ],
     "requiredPermissions": [],
     "requiredFeatures": []
   },
-  "locations": ["centralus", "westus3"],
+  "locations": ["eastus", "westus3"],
   "quotas": [
     {
-      "name": "PostgreSQL Burstable fleet",
+      "name": "Basic App Service Plan",
+      "providerNamespace": "Microsoft.Web",
+      "resourceName": "standardDADSv5Family",
+      "appServicePlanSku": "B1",
+      "appServicePlanTier": "Basic",
+      "requiredAvailable": 14
+    },
+    {
+      "name": "PostgreSQL Flexible Server General Purpose vCores",
       "providerNamespace": "Microsoft.DBforPostgreSQL",
-      "resourceName": "standardBSFamily",
-      "postgresFlexibleSku": "Standard_B2ms",
+      "resourceName": "standardDDSv5Family",
+      "postgresFlexibleSku": "GP_Standard_D2ds_v5",
       "availabilityZone": "auto",
-      "instanceCount": 7,
+      "instanceCount": 8,
       "vCoresPerInstance": 2
     },
     {
-      "name": "Azure OpenAI model quota",
+      "name": "Azure OpenAI",
       "providerNamespace": "Microsoft.CognitiveServices",
       "azureOpenAISku": "S0",
-      "azureOpenAIModel": "gpt-4o",
-      "azureOpenAIDeploymentType": "GlobalStandard",
+      "azureOpenAIModel": "gpt-5.1",
+      "azureOpenAIDeploymentType": "DataZoneStandard",
       "requiredAvailable": 10
     },
     {
@@ -78,10 +99,20 @@ single `location` property is also supported.
       "providerNamespace": "Microsoft.Search",
       "aiSearchSku": "standard",
       "requiredAvailable": 1
+    },
+    {
+      "name": "Azure Managed Redis",
+      "providerNamespace": "Microsoft.Cache",
+      "redisEnterpriseSku": "Balanced_B1",
+      "requiredAvailable": 1
     }
   ]
 }
 ```
+
+Omit `subscriptionId` to use the active Azure CLI subscription. If
+`subscriptionId` is set explicitly, the validator requires it to match the
+active `az account show` context.
 
 Custom quota scopes can contain `{subscriptionId}` and `{location}`
 placeholders.
@@ -128,6 +159,12 @@ Feature registrations are optional and use namespace/name pairs:
 Missing permissions, providers, disabled subscriptions, and unregistered
 features are `blocked`. A prerequisite that cannot be queried is `unknown`.
 
+PostgreSQL Flexible Server, App Service, Azure OpenAI, Azure AI Search, and
+Azure Managed Redis use their service-specific APIs and do not require the
+Microsoft.Quota provider or Azure CLI quota extension. Managed Redis can verify
+that `Balanced_B1` is offered, but Azure does not expose a dependable
+predeployment physical-capacity or service-count quota signal.
+
 ## Run
 
 ```powershell
@@ -137,6 +174,12 @@ pwsh ./scripts/check-deployment-readiness.ps1 `
 
 Results are printed to the console and written to
 `artifacts/deployment-readiness/` as JSON and Markdown.
+
+Run the focused fixture tests with:
+
+```powershell
+pwsh ./tests/run-tests.ps1
+```
 
 ## Result statuses
 
