@@ -1,6 +1,7 @@
 param(
   [string]$ConfigPath = "readiness-config.json",
   [string]$ArtifactDirectory = "artifacts\deployment-readiness",
+  [string]$AzCommand = "az",
   [switch]$VerboseOutput
 )
 
@@ -20,7 +21,7 @@ function Invoke-AzJson {
     Write-Host "az $($Arguments -join ' ')" -ForegroundColor DarkGray
   }
 
-  $output = & az @Arguments 2>&1
+  $output = & $AzCommand @Arguments 2>&1
   if ($LASTEXITCODE -ne 0) {
     throw "$Description failed: $($output -join [Environment]::NewLine)"
   }
@@ -97,7 +98,7 @@ if ($locations.Count -eq 0) {
 $prerequisiteResults = @()
 
 Write-Step "Validating Azure prerequisites"
-if (-not (Get-Command az -ErrorAction SilentlyContinue)) {
+if (-not (Get-Command $AzCommand -ErrorAction SilentlyContinue)) {
   [Console]::Error.WriteLine("Azure CLI is not installed or is not available on PATH.")
   exit 3
 }
@@ -137,15 +138,19 @@ if ($account.state -and [string]$account.state -ne 'Enabled') {
   $prerequisiteResults += New-ReadinessResult -Location subscription -Name 'Subscription state' -Status ready -Category 'prerequisite' -Message "Subscription $subscriptionId is enabled."
 }
 
-# App Service, Azure OpenAI, and Azure AI Search entries use service-specific
-# APIs. The quota extension/provider registration is only required when at
-# least one entry needs the Microsoft.Quota commands.
+# App Service, PostgreSQL Flexible Server, Azure OpenAI, Azure AI Search, and
+# Azure Managed Redis entries use service-specific APIs. The quota extension
+# and Microsoft.Quota provider are only required for generic quota entries.
 $needsQuotaApi = @($config.quotas | Where-Object {
-  -not $_.appServicePlanSku -and -not $_.azureOpenAISku -and -not $_.aiSearchSku
+  -not $_.appServicePlanSku -and
+  -not $_.postgresFlexibleSku -and
+  -not $_.azureOpenAISku -and
+  -not $_.aiSearchSku -and
+  -not $_.redisEnterpriseSku
 }).Count -gt 0
 
 if ($needsQuotaApi) {
-  $quotaExtension = & az extension show --name quota --output none 2>&1
+  $quotaExtension = & $AzCommand extension show --name quota --output none 2>&1
   if ($LASTEXITCODE -ne 0) {
     $prerequisiteResults += New-ReadinessResult -Location subscription -Name 'Azure CLI quota extension' -Status unknown -Category 'extension-missing' -Message "The Azure CLI quota extension is required. Install it with 'az extension add --name quota'."
   } else {
@@ -162,6 +167,7 @@ $derivedProviders = @(
     elseif ($_.postgresFlexibleSku) { 'Microsoft.DBforPostgreSQL' }
     elseif ($_.azureOpenAISku) { 'Microsoft.CognitiveServices' }
     elseif ($_.aiSearchSku) { 'Microsoft.Search' }
+    elseif ($_.redisEnterpriseSku) { 'Microsoft.Cache' }
   } | Where-Object { $_ }
 )
 $configuredProviders = @($config.prerequisites.requiredProviders | ForEach-Object { [string]$_ } | Where-Object { $_ })
@@ -221,7 +227,7 @@ foreach ($feature in @($config.prerequisites.requiredFeatures)) {
     continue
   }
 
-  $featureOutput = & az feature show --namespace $featureNamespace --name $featureName --query properties.state --output tsv 2>&1
+  $featureOutput = & $AzCommand feature show --namespace $featureNamespace --name $featureName --query properties.state --output tsv 2>&1
   if ($LASTEXITCODE -ne 0) {
     $prerequisiteResults += New-ReadinessResult -Location subscription -Name "Feature $featureNamespace/$featureName" -Status unknown -Category 'feature-state-unknown' -Message ($featureOutput -join [Environment]::NewLine)
   } elseif (($featureOutput -join '').Trim() -eq 'Registered') {
@@ -278,7 +284,7 @@ function Test-AppServicePlanQuota {
   # App Service Plan quota is not exposed via 'az quota' (Microsoft.Web is not
   # onboarded to that API), so region availability and quota/usage are read
   # from the classic appservice CLI and the Microsoft.Web usages REST API.
-  $locationsOutput = & az appservice list-locations --sku $Sku --output json 2>&1
+  $locationsOutput = & $AzCommand appservice list-locations --sku $Sku --output json 2>&1
   if ($LASTEXITCODE -ne 0) {
     throw "App Service Plan SKU location lookup for $Sku failed: $($locationsOutput -join [Environment]::NewLine)"
   }
@@ -311,7 +317,7 @@ function Test-AppServicePlanQuota {
   }
 
   $usagesUri = "https://management.azure.com/subscriptions/$SubscriptionId/providers/Microsoft.Web/locations/$Location/usages?api-version=2023-12-01"
-  $usagesOutput = & az rest --method get --uri $usagesUri --output json 2>&1
+  $usagesOutput = & $AzCommand rest --method get --uri $usagesUri --output json 2>&1
   if ($LASTEXITCODE -ne 0) {
     throw "Microsoft.Web usage lookup in $Location failed: $($usagesOutput -join [Environment]::NewLine)"
   }
@@ -337,37 +343,80 @@ function Test-PostgreSqlFlexibleServerSku {
   param(
     [Parameter(Mandatory)][string]$Sku,
     [Parameter(Mandatory)][string]$Location,
+    [Parameter(Mandatory)][string]$Family,
+    [Parameter(Mandatory)][string]$SubscriptionId,
+    [int]$RequiredAvailable = 0,
     [string]$AvailabilityZone
   )
 
   $skuResult = Invoke-AzJson -Arguments @(
     'postgres', 'flexible-server', 'list-skus',
     '--location', $Location,
+    '--only-show-errors',
     '--output', 'json'
   ) -Description "PostgreSQL Flexible Server SKU lookup for $Sku in $Location"
 
-  $skuInfo = @($skuResult | Where-Object {
-    [string]$_.name -eq $Sku -or [string]$_.skuName -eq $Sku
+  $skuEntries = @()
+  foreach ($skuRoot in @($skuResult)) {
+    if ($skuRoot.PSObject.Properties.Name -contains 'supportedServerEditions') {
+      foreach ($edition in @($skuRoot.supportedServerEditions)) {
+        foreach ($serverSku in @($edition.supportedServerSkus)) {
+          $zones = if ($serverSku.supportedZones) { @($serverSku.supportedZones) } else { @($skuRoot.supportedZones) }
+          $skuEntries += [pscustomobject]@{ Sku = $serverSku; SupportedZones = $zones }
+        }
+      }
+    } else {
+      $skuEntries += [pscustomobject]@{ Sku = $skuRoot; SupportedZones = @($skuRoot.supportedZones) }
+    }
+  }
+
+  $configuredSku = $Sku.Trim().ToLowerInvariant()
+  $skuInfoEntry = @($skuEntries | Where-Object {
+    $candidate = [string]$_.Sku.name
+    if (-not $candidate) { $candidate = [string]$_.Sku.skuName }
+    $normalizedCandidate = $candidate.Trim().ToLowerInvariant()
+    $configuredSku -eq $normalizedCandidate -or $configuredSku.EndsWith("_$normalizedCandidate")
   }) | Select-Object -First 1
 
-  if (-not $skuInfo) {
+  if (-not $skuInfoEntry) {
     return [pscustomobject]@{
       Available = $false
       ZonesKnown = $true
       SupportedZones = @()
       ZoneAvailable = $false
+      QuotaKnown = $false
+      Limit = $null
+      Usage = $null
+      HasQuota = $false
     }
   }
 
-  $hasSupportedZones = $skuInfo.PSObject.Properties.Name -contains 'supportedZones'
-  $supportedZones = if ($hasSupportedZones) { @($skuInfo.supportedZones | ForEach-Object { [string]$_ }) } else { @() }
+  $skuInfo = $skuInfoEntry.Sku
+  $hasSupportedZones = $skuInfoEntry.SupportedZones.Count -gt 0
+  $supportedZones = @($skuInfoEntry.SupportedZones | ForEach-Object { [string]$_ })
   $zoneRequested = -not [string]::IsNullOrWhiteSpace($AvailabilityZone) -and $AvailabilityZone -ne 'auto'
+
+  $usageUri = "https://management.azure.com/subscriptions/$SubscriptionId/providers/Microsoft.DBforPostgreSQL/locations/$Location/resourceType/flexibleServers/usages?api-version=2024-11-01-preview"
+  $usageResult = Invoke-AzJson -Arguments @(
+    'rest', '--method', 'get',
+    '--uri', $usageUri,
+    '--output', 'json'
+  ) -Description "PostgreSQL Flexible Server family quota lookup in $Location"
+  $familyUsage = @($usageResult.value | Where-Object {
+    [string]$_.name.value -ieq $Family
+  }) | Select-Object -First 1
+  $limit = if ($familyUsage) { [int]$familyUsage.limit } else { $null }
+  $usage = if ($familyUsage) { [int]$familyUsage.currentValue } else { $null }
 
   return [pscustomobject]@{
     Available = $true
     ZonesKnown = $hasSupportedZones
     SupportedZones = $supportedZones
     ZoneAvailable = (-not $zoneRequested -or ($supportedZones -contains [string]$AvailabilityZone))
+    QuotaKnown = ($null -ne $familyUsage)
+    Limit = $limit
+    Usage = $usage
+    HasQuota = ($null -ne $familyUsage -and (($limit - $usage) -ge $RequiredAvailable))
   }
 }
 
@@ -386,13 +435,13 @@ function Test-AzureOpenAISku {
   ) -Description "Azure OpenAI SKU eligibility lookup for $Sku in $Location"
 
   $matches = @($skuResult.value | Where-Object {
-    [string]$_.name -eq $Sku -and
-    [string]$_.resourceType -eq 'accounts' -and
+    [string]$_.name -ieq $Sku -and
+    [string]$_.resourceType -ieq 'accounts' -and
     (
-      [string]$_.kind -eq 'OpenAI' -or
-      @($_.capabilities | Where-Object { [string]$_.name -eq 'Kind' -and [string]$_.value -eq 'OpenAI' }).Count -gt 0
+      [string]$_.kind -ieq 'OpenAI' -or
+      @($_.capabilities | Where-Object { [string]$_.name -ieq 'Kind' -and [string]$_.value -ieq 'OpenAI' }).Count -gt 0
     ) -and
-    @($_.locations | Where-Object { [string]$_ -eq $Location }).Count -gt 0
+    @($_.locations | Where-Object { [string]$_ -ieq $Location }).Count -gt 0
   })
 
   if ($matches.Count -eq 0) {
@@ -400,8 +449,8 @@ function Test-AzureOpenAISku {
   }
 
   $restricted = @($matches.restrictions | Where-Object {
-    [string]$_.type -eq 'Location' -and
-    @($_.values | Where-Object { [string]$_ -eq $Location }).Count -gt 0
+    [string]$_.type -ieq 'Location' -and
+    @($_.values | Where-Object { [string]$_ -ieq $Location }).Count -gt 0
   }).Count -gt 0
 
   return [pscustomobject]@{ Available = $true; Restricted = $restricted }
@@ -416,7 +465,7 @@ function Test-AzureOpenAIModelQuota {
     [int]$RequiredAvailable = 0
   )
 
-  $usageOutput = & az cognitiveservices usage list --location $Location --subscription $SubscriptionId --output json 2>&1
+  $usageOutput = & $AzCommand cognitiveservices usage list --location $Location --subscription $SubscriptionId --output json 2>&1
   if ($LASTEXITCODE -ne 0) {
     throw "Azure OpenAI model quota lookup in $Location failed: $($usageOutput -join [Environment]::NewLine)"
   }
@@ -459,24 +508,6 @@ function Test-AISearchReadiness {
     [int]$RequiredAvailable = 1
   )
 
-  $skuOutput = & az search service list-sku --location $Location --subscription $SubscriptionId --output json 2>&1
-  if ($LASTEXITCODE -ne 0) {
-    throw "Azure AI Search SKU lookup in $Location failed: $($skuOutput -join [Environment]::NewLine)"
-  }
-  $skus = @(($skuOutput -join [Environment]::NewLine) | ConvertFrom-Json)
-  $skuAvailable = @($skus | Where-Object {
-    [string]$_.name -eq $Sku -or [string]$_.name.value -eq $Sku
-  }).Count -gt 0
-  if (-not $skuAvailable) {
-    return [pscustomobject]@{
-      SkuAvailable = $false
-      QuotaKnown = $false
-      Limit = $null
-      Usage = $null
-      HasQuota = $false
-    }
-  }
-
   $usageUri = "https://management.azure.com/subscriptions/$SubscriptionId/providers/Microsoft.Search/locations/$Location/usages?api-version=2025-05-01"
   $usageResult = Invoke-AzJson -Arguments @(
     'rest', '--method', 'get',
@@ -484,14 +515,20 @@ function Test-AISearchReadiness {
     '--output', 'json'
   ) -Description "Azure AI Search usage lookup in $Location"
 
+  $normalize = { param($value) ([string]$value -replace '[^A-Za-z0-9]', '').ToLowerInvariant() }
+  $normalizedSku = & $normalize $Sku
   $serviceUsage = @($usageResult.value | Where-Object {
-    [string]$_.name.value -match 'search.*service|service.*search' -or
-    [string]$_.name.localizedValue -match 'search.*service|service.*search'
+    $valueName = & $normalize $_.name.value
+    $localizedName = & $normalize $_.name.localizedValue
+    $valueName -eq $normalizedSku -or
+    $valueName -eq "${normalizedSku}sku" -or
+    $localizedName -eq $normalizedSku -or
+    $localizedName -eq "${normalizedSku}sku"
   }) | Select-Object -First 1
 
   if (-not $serviceUsage) {
     return [pscustomobject]@{
-      SkuAvailable = $true
+      SkuAvailable = $false
       QuotaKnown = $false
       Limit = $null
       Usage = $null
@@ -508,6 +545,40 @@ function Test-AISearchReadiness {
     Usage = $usage
     HasQuota = (($limit - $usage) -ge $RequiredAvailable)
   }
+}
+
+function Test-ManagedRedisSku {
+  param(
+    [Parameter(Mandatory)][string]$Sku,
+    [Parameter(Mandatory)][string]$Location,
+    [Parameter(Mandatory)][string]$SubscriptionId
+  )
+
+  $skuUri = "https://management.azure.com/subscriptions/$SubscriptionId/providers/Microsoft.Cache/skus?api-version=2025-04-01"
+  $skuResult = Invoke-AzJson -Arguments @(
+    'rest', '--method', 'get',
+    '--uri', $skuUri,
+    '--output', 'json'
+  ) -Description "Azure Managed Redis SKU lookup for $Sku in $Location"
+
+  $matches = @($skuResult.value | Where-Object {
+    [string]$_.name -ieq $Sku -and
+    [string]$_.resourceType -ieq 'redisEnterprise' -and
+    (
+      -not $_.locations -or
+      @($_.locations | Where-Object { [string]$_ -ieq $Location }).Count -gt 0
+    )
+  })
+  if ($matches.Count -eq 0) {
+    return [pscustomobject]@{ Available = $false; Restricted = $false }
+  }
+
+  $restricted = @($matches.restrictions | Where-Object {
+    [string]$_.type -ieq 'Location' -and
+    @($_.values | Where-Object { [string]$_ -ieq $Location }).Count -gt 0
+  }).Count -gt 0
+
+  return [pscustomobject]@{ Available = $true; Restricted = $restricted }
 }
 
 $checkErrors = @()
@@ -530,6 +601,7 @@ foreach ($location in $locations) {
     $azureOpenAIModel = [string]$quota.azureOpenAIModel
     $azureOpenAIDeploymentType = [string]$quota.azureOpenAIDeploymentType
     $aiSearchSku = [string]$quota.aiSearchSku
+    $redisEnterpriseSku = [string]$quota.redisEnterpriseSku
     $requiredAvailable = if ($null -ne $quota.requiredAvailable) { [int]$quota.requiredAvailable } else { 0 }
     $resourceType = if ($quota.resourceType) { [string]$quota.resourceType } else { 'dedicated' }
 
@@ -538,6 +610,7 @@ foreach ($location in $locations) {
       elseif ($postgresFlexibleSku) { 'Microsoft.DBforPostgreSQL' }
       elseif ($azureOpenAISku) { 'Microsoft.CognitiveServices' }
       elseif ($aiSearchSku) { 'Microsoft.Search' }
+      elseif ($redisEnterpriseSku) { 'Microsoft.Cache' }
     }
 
     if ($postgresFlexibleSku -and $requiredAvailable -eq 0 -and $quota.instanceCount -and $quota.vCoresPerInstance) {
@@ -659,8 +732,15 @@ foreach ($location in $locations) {
     if ($postgresFlexibleSku) {
       Write-Host "PostgreSQL SKU:     $postgresFlexibleSku"
       Write-Host "Availability zone:  $(if ($availabilityZone) { $availabilityZone } else { 'auto' })"
+      if (-not $resourceName) {
+        $message = "$displayName sets postgresFlexibleSku but is missing resourceName."
+        $checkErrors += $message
+        $readinessResults += New-ReadinessResult -Location $location -Name $displayName -Status unknown -Category 'invalid-configuration' -Message $message
+        Write-Warning $message
+        continue
+      }
       try {
-        $postgresCheck = Test-PostgreSqlFlexibleServerSku -Sku $postgresFlexibleSku -Location $location -AvailabilityZone $availabilityZone
+        $postgresCheck = Test-PostgreSqlFlexibleServerSku -Sku $postgresFlexibleSku -Location $location -Family $resourceName -SubscriptionId $subscriptionId -RequiredAvailable $requiredAvailable -AvailabilityZone $availabilityZone
       } catch {
         $message = "$displayName PostgreSQL SKU lookup failed in ${location}: $_"
         $checkErrors += $message
@@ -691,6 +771,51 @@ foreach ($location in $locations) {
           continue
         }
       }
+
+      if (-not $postgresCheck.QuotaKnown) {
+        $message = "PostgreSQL SKU $postgresFlexibleSku is offered in $location, but family quota '$resourceName' was not returned by the Flexible Server usages API."
+        $checkErrors += $message
+        $readinessResults += New-ReadinessResult -Location $location -Name $displayName -Status unknown -Category 'quota-not-exposed' -Message $message
+        Write-Warning $message
+        continue
+      }
+
+      Write-Host "Current usage:      $($postgresCheck.Usage)"
+      Write-Host "Current limit:      $($postgresCheck.Limit)"
+      if (-not $postgresCheck.HasQuota) {
+        $reason = "PostgreSQL Flexible Server quota is insufficient in $location. Usage is $($postgresCheck.Usage) of $($postgresCheck.Limit); $requiredAvailable additional vCores are required."
+        $readinessResults += New-ReadinessResult -Location $location -Name $displayName -Status blocked -Category 'quota-deficit' -Message $reason
+        Write-Warning $reason
+      } else {
+        $message = "PostgreSQL Flexible Server SKU, zone, and family quota checks passed."
+        $readinessResults += New-ReadinessResult -Location $location -Name $displayName -Status ready -Category 'verified' -Message $message
+        Write-Host "PASS: $message" -ForegroundColor Green
+      }
+      continue
+    }
+
+    if ($redisEnterpriseSku) {
+      Write-Host "Managed Redis SKU:  $redisEnterpriseSku"
+      try {
+        $redisCheck = Test-ManagedRedisSku -Sku $redisEnterpriseSku -Location $location -SubscriptionId $subscriptionId
+      } catch {
+        $message = "$displayName Azure Managed Redis SKU lookup failed in ${location}: $_"
+        $checkErrors += $message
+        $readinessResults += New-ReadinessResult -Location $location -Name $displayName -Status unknown -Category 'eligibility-check-failed' -Message $message
+        Write-Warning $message
+        continue
+      }
+
+      if (-not $redisCheck.Available -or $redisCheck.Restricted) {
+        $reason = "Azure Managed Redis SKU $redisEnterpriseSku is unavailable or restricted for this subscription in $location."
+        $readinessResults += New-ReadinessResult -Location $location -Name $displayName -Status blocked -Category 'sku-unavailable' -Message $reason
+        Write-Warning $reason
+      } else {
+        $message = "Azure Managed Redis SKU $redisEnterpriseSku is offered in $location. Physical capacity and service-count quota are not guaranteed by the SKU API."
+        $readinessResults += New-ReadinessResult -Location $location -Name $displayName -Status 'ready-with-risk' -Category 'runtime-capacity-unverifiable' -Message $message
+        Write-Host "PASS WITH RISK: $message" -ForegroundColor Yellow
+      }
+      continue
     }
 
     if ($appServicePlanSku) {
@@ -849,7 +974,7 @@ foreach ($result in $readinessResults) {
   $readinessSummary.AppendLine("| $($result.location) | $($result.name) | $($result.status) | $($result.category) | $safeMessage |") | Out-Null
 }
 $readinessSummary.AppendLine() | Out-Null
-$readinessSummary.AppendLine("`ready-with-risk` means all verifiable checks passed, but Azure does not expose a reliable predeployment physical-capacity signal for the service.") | Out-Null
+$readinessSummary.AppendLine('`ready-with-risk` means all verifiable checks passed, but Azure does not expose a reliable predeployment physical-capacity signal for the service.') | Out-Null
 $readinessSummary.ToString() | Out-File -FilePath $readinessMarkdownPath -Encoding utf8
 
 Write-Step "Deployment readiness summary"
