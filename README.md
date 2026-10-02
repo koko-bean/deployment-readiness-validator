@@ -204,6 +204,130 @@ pwsh ./tests/run-tests.ps1
 The included workflow uses the `AZURE_CREDENTIALS` repository secret. Create a
 deployment-specific `readiness-config.json` before running it.
 
-The repository intentionally contains no quota-request submission, support
-ticket generation, infrastructure deployment, dashboards, or quota-utilization
-reporting components.
+The workflow runs readiness checks only. Infrastructure deployment is available
+through the separate **opt-in canary stage** below; it is not enabled in CI.
+There is no quota-request submission, support ticket generation, dashboard, or
+quota-utilization reporting.
+
+## Opt-in deployment canaries
+
+Run readiness first, even when it returns exit `2` because some services are
+blocked. Then plan or execute canaries for the remaining `ready` or
+`ready-with-risk` services:
+
+```powershell
+pwsh -NoProfile -File scripts\check-deployment-readiness.ps1 `
+  -ConfigPath readiness-config.sample.json
+
+# Dry run (default): plan only; no Azure resources are created.
+pwsh -NoProfile -File scripts\run-canary-deployments.ps1 `
+  -ConfigPath readiness-config.sample.json
+
+# Creates temporary resources, polls ARM, and destroys them.
+pwsh -NoProfile -File scripts\run-canary-deployments.ps1 `
+  -ConfigPath readiness-config.sample.json -Execute
+```
+
+`-ReadinessReport` selects an explicit JSON report; otherwise the newest
+`deployment-readiness-*.json` in `-ArtifactDirectory` is used. The artifact
+directory defaults to `artifacts\deployment-readiness`. `-TimeoutMinutes`
+defaults to 60 for deployment polling, with a separate cleanup polling budget
+of the same length. `-PollIntervalSeconds` defaults to 10. Azure CLI calls
+themselves may take longer than the polling deadline.
+
+Use the same unchanged configuration and active `az login` subscription for
+both stages. The readiness JSON remains an array, with additive
+`subscriptionId` and SHA-256 `configurationHash` fields on each row. Execution
+rejects reports without matching provenance; regenerate older reports. The
+script pins Azure calls to that subscription. Reports remain point-in-time
+snapshots; rerun readiness immediately before executing canaries.
+
+### Footprints and scope
+
+Each eligible service/region gets a separate incremental ARM deployment:
+
+| Service | Minimal canary |
+|---|---|
+| App Service | Configured SKU and tier, one Linux plan instance (no web app) |
+| PostgreSQL Flexible Server | Configured prefixed SKU (`GP_`, `MO_`, or `B_`), 32 GB storage, HA disabled, PostgreSQL 16, public access disabled; explicit non-`auto` zone honored |
+| OpenAI | Configured account SKU, public access and local authentication disabled, model deployment capacity 1 |
+| AI Search | Configured SKU, one replica and partition, public access and local authentication disabled |
+| Managed Redis | Configured SKU, HA disabled, TLS default database, access-key authentication disabled |
+
+OpenAI resolves a compatible default model version from the regional models
+API, with the latest compatible version as fallback. Set
+`azureOpenAIModelVersion` on the quota entry to pin a version. Deployment types
+requiring capacity above 1 are rejected for review rather than silently
+provisioning a larger, expensive footprint. VM and generic quota entries
+produce `canary-not-supported`; blocked/unknown services are skipped. Missing,
+blocked, or unknown subscription prerequisites prevent canary submission.
+Redis's selected ARM API does not expose a public-network-access switch; no
+credentials or data are loaded, and key authentication is disabled.
+
+### Safety, cost, and permissions
+
+Execution **incurs normal Azure charges** for the selected SKUs until deletion.
+No application traffic, inference, or customer data is sent. Minimal footprints
+are not necessarily cheap when the configured SKU is large. Review the dry-run
+plan and SKU prices before opting in.
+
+The runner creates one new group tagged with `purpose`, `createdBy`, `runId`,
+and `expiresAt`. `-ResourceGroupName` overrides the generated name but **must
+not already exist**. The runner refuses to delete a group whose ownership tags
+do not match its run. Never add other resources to this group while it runs.
+Expiry tags are informational, not an automatic deletion policy.
+
+Use **Contributor on the subscription**, or a custom role granting resource
+group creation/read/deletion, ARM deployment/operation read/write/cancel,
+resource enumeration, and the selected service resource/child-resource actions.
+OpenAI cleanup additionally requires
+`Microsoft.CognitiveServices/locations/resourceGroups/deletedAccounts/delete`
+and the corresponding deleted-account read/list permissions. Reader alone
+cannot execute canaries. Organizational policies/locks can block creation,
+deletion, or purge even with Contributor.
+
+A `finally` block cancels nonterminal deployments, deletes the group, polls
+until it no longer exists, and purges/verifies soft-deleted OpenAI accounts.
+PostgreSQL passwords are cryptographically generated, passed as ARM
+`secureString` through protected temporary parameter files, redacted from
+errors, and removed immediately after submission. They are never written into
+reports or command arguments.
+
+**Do not force-kill the process or close its host while it runs.** Power loss,
+host termination, Azure permissions, locks, or outages can prevent cleanup.
+Keep the group name from the JSON report and remove any remaining group/accounts
+manually when necessary. Before provisioning, the runner writes a secret-free
+`canary-recovery-<runId>.json` inventory so group/account identifiers remain
+available even if the process is terminated before the hand-off is generated.
+Cleanup failures return exit `4`, with a prominent
+warning and leftover or unverified resource IDs in the reports.
+
+### Customer/business-unit hand-off
+
+Both modes generate `subscription-readiness-<runId>.json` and `.md` in the
+artifact directory. They include subscription, UTC timestamps, regions,
+subscription prerequisites, executive counts, per-service readiness/canary/
+cleanup/purge results, ARM failure details, final verdicts, and next actions.
+
+| Final verdict | Meaning |
+|---|---|
+| `verified-deployable` | Minimal ARM deployment succeeded and resource cleanup succeeded |
+| `not-deployable` | Known readiness blocker or ARM quota/capacity/region failure |
+| `needs-review` | Unknown readiness, missing prerequisites, noncapacity error, timeout, or failed cleanup |
+| `not-tested` | Dry-run eligible entry or unsupported canary type |
+
+Canary exit codes are separate from readiness exit codes:
+
+| Code | Meaning |
+|---|---|
+| `0` | Every tested canary and cleanup succeeded (dry runs/unsupported entries may remain untested) |
+| `2` | Known not-deployable result, including skipped readiness blockers |
+| `3` | Needs-review, unknown, or execution/configuration error; takes priority over `2` |
+| `4` | Cleanup/cancellation/purge failure; highest priority |
+
+These are **minimal, point-in-time deployment results**. They reserve no
+capacity and do **not** prove full-scale capacity (such as 14 App Service
+instances or 8 PostgreSQL servers), connectivity, data-plane functionality,
+performance, or application correctness. Reassess quota and capacity before
+production rollout. Generated artifacts are ignored by Git; review their
+subscription/resource identifiers before distributing them.
