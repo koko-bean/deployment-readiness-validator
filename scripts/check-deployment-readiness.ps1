@@ -963,6 +963,11 @@ $timestamp = Get-Date -Format 'yyyyMMdd-HHmmss'
 $readinessJsonPath = Join-Path $ArtifactDirectory "deployment-readiness-$timestamp.json"
 $readinessMarkdownPath = Join-Path $ArtifactDirectory "deployment-readiness-$timestamp.md"
 
+$configurationHash = (Get-FileHash -Path $ConfigPath -Algorithm SHA256).Hash
+foreach ($result in $readinessResults) {
+  $result | Add-Member -NotePropertyName subscriptionId -NotePropertyValue $subscriptionId
+  $result | Add-Member -NotePropertyName configurationHash -NotePropertyValue $configurationHash
+}
 $readinessResults | ConvertTo-Json -Depth 8 -AsArray | Out-File -FilePath $readinessJsonPath -Encoding utf8
 $readinessSummary = New-Object System.Text.StringBuilder
 $readinessSummary.AppendLine("# Deployment readiness - $timestamp") | Out-Null
