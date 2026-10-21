@@ -118,17 +118,43 @@ if ($command -like 'rest *Microsoft.Authorization/permissions*') {
 }
 
 if ($command -like 'appservice list-locations *') {
+  if ($scenario -eq 'appservice-unavailable') { Write-Output '[]'; exit 0 }
   Write-Output '["East US"]'
   exit 0
 }
 
 if ($command -like 'account list-locations *') {
+  if ($CliArgs -contains '--subscription') { Write-Error 'unrecognized arguments: --subscription'; exit 2 }
   Write-Output '[{"name":"eastus","displayName":"East US"}]'
   exit 0
 }
 
 if ($command -like 'rest *Microsoft.Web/locations/eastus/usages*') {
-  Write-Output '{"value":[{"name":{"value":"standardDADSv5Family","localizedValue":"Basic"},"limit":20,"currentValue":1}]}'
+  if ($command -notlike '*api-version=2024-11-01*' -or $scenario -eq 'appservice-api-error') {
+    Write-Error 'MethodNotAllowed: The requested method is not implemented.'
+    exit 1
+  }
+  $skuCounter = @{ name = @{ value = 'B1'; localizedValue = 'B1 VMs' }; limit = 20; currentValue = 1 }
+  $totalCounter = @{ name = @{ value = '*'; localizedValue = 'Total Regional VMs' }; limit = 100; currentValue = 2 }
+  switch ($scenario) {
+    'appservice-sku-deficit' { $skuCounter.limit = 14 }
+    'appservice-regional-deficit' { $totalCounter.limit = 15 }
+    'appservice-boundary' { $skuCounter.limit = 15; $totalCounter.limit = 16 }
+    'appservice-zero' { $skuCounter.limit = 0; $skuCounter.currentValue = 0 }
+    'appservice-negative-limit' { $skuCounter.limit = -1 }
+    'appservice-negative-usage' { $skuCounter.currentValue = -1 }
+    'appservice-invalid-limit' { $skuCounter.limit = 'invalid' }
+    'appservice-null-usage' { $skuCounter.currentValue = $null }
+  }
+  $counters = @($skuCounter, $totalCounter)
+  if ($scenario -eq 'appservice-missing-sku') { $counters = @($totalCounter) }
+  if ($scenario -eq 'appservice-missing-total') { $counters = @($skuCounter) }
+  if ($scenario -eq 'appservice-missing-sku-deficit') { $totalCounter.limit = 0; $totalCounter.currentValue = 0; $counters = @($totalCounter) }
+  if ($scenario -eq 'appservice-duplicate') { $counters += $skuCounter }
+  if ($scenario -eq 'appservice-legacy') {
+    $counters = @(@{ name = @{ value = 'standardDADSv5Family'; localizedValue = 'Basic' }; limit = -1; currentValue = 1 })
+  }
+  @{ value = $counters } | ConvertTo-Json -Depth 8 -Compress
   exit 0
 }
 

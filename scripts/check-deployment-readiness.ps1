@@ -275,8 +275,6 @@ function Test-VmSkuAvailability {
 function Test-AppServicePlanQuota {
   param(
     [Parameter(Mandatory)][string]$Sku,
-    [Parameter(Mandatory)][string]$Tier,
-    [Parameter(Mandatory)][string]$Family,
     [Parameter(Mandatory)][string]$Location,
     [Parameter(Mandatory)][string]$SubscriptionId
   )
@@ -284,11 +282,10 @@ function Test-AppServicePlanQuota {
   # App Service Plan quota is not exposed via 'az quota' (Microsoft.Web is not
   # onboarded to that API), so region availability and quota/usage are read
   # from the classic appservice CLI and the Microsoft.Web usages REST API.
-  $locationsOutput = & $AzCommand appservice list-locations --sku $Sku --output json 2>&1
-  if ($LASTEXITCODE -ne 0) {
-    throw "App Service Plan SKU location lookup for $Sku failed: $($locationsOutput -join [Environment]::NewLine)"
-  }
-  $locations = @(($locationsOutput -join [Environment]::NewLine) | ConvertFrom-Json)
+  $locations = @(Invoke-AzJson -Arguments @(
+    'appservice', 'list-locations', '--sku', $Sku,
+    '--subscription', $SubscriptionId, '--only-show-errors', '--output', 'json'
+  ) -Description "App Service Plan SKU location lookup for $Sku")
 
   $candidateNames = @($Location)
   $displayNameLookup = Invoke-AzJson -Arguments @(
@@ -316,26 +313,36 @@ function Test-AppServicePlanQuota {
     return [pscustomobject]@{ RegionAvailable = $false; Limit = $null; Usage = $null }
   }
 
-  $usagesUri = "https://management.azure.com/subscriptions/$SubscriptionId/providers/Microsoft.Web/locations/$Location/usages?api-version=2023-12-01"
-  $usagesOutput = & $AzCommand rest --method get --uri $usagesUri --output json 2>&1
-  if ($LASTEXITCODE -ne 0) {
-    throw "Microsoft.Web usage lookup in $Location failed: $($usagesOutput -join [Environment]::NewLine)"
-  }
-  $usages = @((($usagesOutput -join [Environment]::NewLine) | ConvertFrom-Json).value)
-  $normalizedTier = & $normalize $Tier
-
-  $match = $usages | Where-Object {
-    $_.name.value -eq $Family -and (& $normalize $_.name.localizedValue) -eq $normalizedTier
-  } | Select-Object -First 1
-
-  if (-not $match) {
-    return [pscustomobject]@{ RegionAvailable = $true; Limit = $null; Usage = $null }
+  $usagesUri = "https://management.azure.com/subscriptions/$SubscriptionId/providers/Microsoft.Web/locations/$Location/usages?api-version=2024-11-01"
+  $usages = Invoke-AzJson -Arguments @(
+    'rest', '--method', 'get', '--uri', $usagesUri,
+    '--subscription', $SubscriptionId, '--only-show-errors', '--output', 'json'
+  ) -Description "Microsoft.Web usage lookup in $Location"
+  $counters = @()
+  $unavailableCounters = @()
+  foreach ($counterName in @($Sku, '*')) {
+    $matches = @($usages.value | Where-Object { $_.name.value -eq $counterName })
+    if ($matches.Count -ne 1) {
+      $unavailableCounters += "'$counterName' (missing or duplicated)"
+      continue
+    }
+    $match = $matches[0]
+    # Negative limits are not usable quota numbers; never subtract from them.
+    $limit = 0L
+    $usage = 0L
+    if (-not [long]::TryParse([string]$match.limit, [ref]$limit) -or
+        -not [long]::TryParse([string]$match.currentValue, [ref]$usage) -or
+        $limit -lt 0 -or $usage -lt 0) {
+      $unavailableCounters += "'$counterName' (invalid or negative limit/usage)"
+      continue
+    }
+    $counters += [pscustomobject]@{ Name = $counterName; Limit = $limit; Usage = $usage; Available = $limit - $usage }
   }
 
   return [pscustomobject]@{
     RegionAvailable = $true
-    Limit = [int]$match.limit
-    Usage = [int]$match.currentValue
+    Counters = $counters
+    UnavailableCounters = $unavailableCounters
   }
 }
 
@@ -822,8 +829,8 @@ foreach ($location in $locations) {
       Write-Host "App Service SKU:    $appServicePlanSku"
       Write-Host "App Service tier:   $appServicePlanTier"
 
-      if (-not $appServicePlanTier -or -not $resourceName) {
-        $message = "$displayName sets appServicePlanSku but is missing appServicePlanTier or resourceName."
+      if (-not $appServicePlanTier) {
+        $message = "$displayName sets appServicePlanSku but is missing appServicePlanTier."
         $checkErrors += $message
         $readinessResults += New-ReadinessResult -Location $location -Name $displayName -Status unknown -Category 'invalid-configuration' -Message $message
         Write-Warning $message
@@ -831,7 +838,7 @@ foreach ($location in $locations) {
       }
 
       try {
-        $planCheck = Test-AppServicePlanQuota -Sku $appServicePlanSku -Tier $appServicePlanTier -Family $resourceName -Location $location -SubscriptionId $subscriptionId
+        $planCheck = Test-AppServicePlanQuota -Sku $appServicePlanSku -Location $location -SubscriptionId $subscriptionId
       } catch {
         $message = "$displayName App Service Plan availability lookup failed in ${location}: $_"
         $checkErrors += $message
@@ -847,30 +854,32 @@ foreach ($location in $locations) {
         continue
       }
 
-      if ($null -eq $planCheck.Limit) {
-        $message = "${displayName}: no Microsoft.Web quota entry matched family '$resourceName' and tier '$appServicePlanTier' in $location."
+      foreach ($counter in $planCheck.Counters) {
+        Write-Host "Quota $($counter.Name): usage $($counter.Usage) of $($counter.Limit); available $($counter.Available)"
+      }
+      $deficits = @($planCheck.Counters | Where-Object { $_.Available -lt $requiredAvailable })
+      if ($deficits.Count -gt 0) {
+        $details = ($deficits | ForEach-Object { "$($_.Name): $($_.Available) available ($($_.Usage) of $($_.Limit) used)" }) -join '; '
+        $reason = "App Service quota is insufficient in $location. $details; required additional instances: $requiredAvailable."
+        if ($planCheck.UnavailableCounters.Count -gt 0) {
+          $reason += " Other quota counters could not be verified: $($planCheck.UnavailableCounters -join ', ')."
+        }
+        $readinessResults += New-ReadinessResult -Location $location -Name $displayName -Status blocked -Category 'quota-deficit' -Message $reason
+        Write-Warning $reason
+        continue
+      }
+
+      if ($planCheck.UnavailableCounters.Count -gt 0) {
+        $message = "${displayName}: Microsoft.Web quota counters could not be verified in ${location}: $($planCheck.UnavailableCounters -join ', '). Expected SKU '$appServicePlanSku' and total regional '*' counters from API 2024-11-01."
         $checkErrors += $message
         $readinessResults += New-ReadinessResult -Location $location -Name $displayName -Status unknown -Category 'quota-not-exposed' -Message $message
         Write-Warning $message
         continue
       }
 
-      $limit = $planCheck.Limit
-      $usage = $planCheck.Usage
-      $available = $limit - $usage
-      Write-Host "Current usage:      $usage"
-      Write-Host "Current limit:      $limit"
-      Write-Host "Available:          $available"
-
-      if ($available -lt $requiredAvailable) {
-        $reason = "App Service quota is insufficient in $location. Available: $available; required: $requiredAvailable."
-        $readinessResults += New-ReadinessResult -Location $location -Name $displayName -Status blocked -Category 'quota-deficit' -Message $reason
-        Write-Warning $reason
-      } else {
-        $message = "App Service quota and SKU checks passed. Physical scale-unit capacity cannot be verified before provisioning."
-        $readinessResults += New-ReadinessResult -Location $location -Name $displayName -Status 'ready-with-risk' -Category 'runtime-capacity-unverifiable' -Message $message
-        Write-Host "PASS WITH RISK: $message" -ForegroundColor Yellow
-      }
+      $message = "App Service SKU and total regional quota checks passed. Physical scale-unit capacity cannot be verified before provisioning."
+      $readinessResults += New-ReadinessResult -Location $location -Name $displayName -Status 'ready-with-risk' -Category 'runtime-capacity-unverifiable' -Message $message
+      Write-Host "PASS WITH RISK: $message" -ForegroundColor Yellow
       continue
     }
 
