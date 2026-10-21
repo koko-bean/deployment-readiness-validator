@@ -98,6 +98,38 @@ try {
   Assert-True (@($results | Where-Object { $_.name -eq 'Azure Managed Redis' -and $_.status -eq 'ready-with-risk' }).Count -eq 1) 'Managed Redis did not return ready-with-risk.'
   Assert-True ((Get-Content $markdownArtifact.FullName -Raw) -match '`ready-with-risk` means') 'Markdown footer did not preserve literal ready-with-risk.'
 
+  Assert-True ($ready.Log -match 'Microsoft.Web/locations/eastus/usages\?api-version=2024-11-01') 'App Service did not use the per-SKU quota API.'
+  Assert-True (@($results | Where-Object { $_.name -eq 'Basic App Service Plan' -and $_.status -eq 'ready-with-risk' }).Count -eq 1) 'App Service SKU and regional counters were not accepted.'
+  $appConfig = $sample | ConvertTo-Json -Depth 20 | ConvertFrom-Json
+  $appConfig.quotas = @($appConfig.quotas[0])
+  $appConfig.quotas[0].PSObject.Properties.Remove('resourceName')
+  foreach ($scenario in @(
+    'appservice-boundary', 'appservice-sku-deficit', 'appservice-regional-deficit',
+    'appservice-zero', 'appservice-negative-limit', 'appservice-negative-usage',
+    'appservice-invalid-limit', 'appservice-null-usage', 'appservice-missing-sku',
+    'appservice-missing-total', 'appservice-duplicate', 'appservice-legacy',
+    'appservice-api-error', 'appservice-unavailable', 'appservice-missing-sku-deficit'
+  )) {
+    $expectedStatus = 'unknown'
+    $expectedCode = 3
+    $expectedCategory = 'quota-not-exposed'
+    if ($scenario -eq 'appservice-boundary') {
+      $expectedStatus = 'ready-with-risk'; $expectedCode = 0; $expectedCategory = 'runtime-capacity-unverifiable'
+    } elseif ($scenario -in @('appservice-sku-deficit', 'appservice-regional-deficit', 'appservice-zero', 'appservice-missing-sku-deficit')) {
+      $expectedStatus = 'blocked'; $expectedCode = 2; $expectedCategory = 'quota-deficit'
+    } elseif ($scenario -eq 'appservice-unavailable') {
+      $expectedStatus = 'blocked'; $expectedCode = 2; $expectedCategory = 'sku-unavailable'
+    } elseif ($scenario -eq 'appservice-api-error') {
+      $expectedCategory = 'eligibility-check-failed'
+    }
+    $run = Invoke-TestRun -Config $appConfig -Name $scenario -Scenario $scenario
+    Assert-True ($run.ExitCode -eq $expectedCode) "$scenario expected exit $expectedCode, got $($run.ExitCode).`n$($run.Output)"
+    $artifact = Get-ChildItem $run.Artifacts -Filter '*.json' | Select-Object -First 1
+    $row = @(Get-Content $artifact.FullName -Raw | ConvertFrom-Json) | Where-Object name -eq 'Basic App Service Plan'
+    Assert-True ($row.status -eq $expectedStatus -and $row.category -eq $expectedCategory) "$scenario returned incorrect classification."
+    Assert-True ($run.Log -notmatch 'api-version=2023-12-01') "$scenario fell back to the unreliable legacy quota API."
+  }
+
   $blocked = Invoke-TestRun -Config $sample -Name 'blocked' -Scenario 'search-blocked'
   Assert-True ($blocked.ExitCode -eq 2) "Expected Azure quota blocker exit 2, got $($blocked.ExitCode)."
 

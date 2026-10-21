@@ -72,7 +72,6 @@ single `location` property is also supported.
     {
       "name": "Basic App Service Plan",
       "providerNamespace": "Microsoft.Web",
-      "resourceName": "standardDADSv5Family",
       "appServicePlanSku": "B1",
       "appServicePlanTier": "Basic",
       "requiredAvailable": 14
@@ -164,6 +163,16 @@ Azure Managed Redis use their service-specific APIs and do not require the
 Microsoft.Quota provider or Azure CLI quota extension. Managed Redis can verify
 that `Balanced_B1` is offered, but Azure does not expose a dependable
 predeployment physical-capacity or service-count quota signal.
+
+App Service uses the Microsoft.Web usages API version `2024-11-01` and checks
+both the exact `appServicePlanSku` counter (for example, `B1`) and the total
+regional `*` counter against `requiredAvailable` additional instances.
+`appServicePlanTier` remains required; `resourceName` is no longer needed for
+App Service (existing values are ignored). Legacy family/tier quota responses
+are not interchangeable with the newer SKU counters. Missing, duplicated,
+malformed, or negative counters produce `unknown`, unless another usable
+counter already proves a quota deficit. API errors, including
+`MethodNotAllowed`, remain `unknown`; there is no silent legacy API fallback.
 
 ## Run
 

@@ -20,7 +20,6 @@
     {
       "name": "Basic App Service Plan",
       "providerNamespace": "Microsoft.Web",
-      "resourceName": "standardDADSv5Family",
       "appServicePlanSku": "B1",
       "appServicePlanTier": "Basic",
       "requiredAvailable": 14
